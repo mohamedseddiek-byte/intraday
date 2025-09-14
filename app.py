@@ -1,28 +1,39 @@
-# app.py — Intraday Recommender + Presets + Signals + Backtest + Scanner (with S&P500 auto)
+# app.py — One-file, cloud-stable Intraday Recommender + Scanner
+# Fixes: pinned behavior, cache-bypass, retries, explicit TZ, S&P500 auto, presets, strict/non-strict
+import time
 import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
 from dataclasses import dataclass
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List
 
-st.set_page_config(page_title="Intraday Recommender", layout="wide")
+# -------------------------------
+# Page setup
+# -------------------------------
+st.set_page_config(page_title="Intraday Recommender & Scanner", page_icon="📈", layout="wide")
+st.title("📈 Intraday Recommender & Scanner")
 
-# -----------------------------------
-# Yahoo limits & helpers
-# -----------------------------------
+# -------------------------------
+# Constants & helpers
+# -------------------------------
 MAX_DAYS = {"1m":7, "2m":60, "5m":60, "15m":60, "30m":60, "60m":730}
-FALLBACKS = {
-    "1m":["2m","5m"], "2m":["5m","15m"], "5m":["15m","30m"],
-    "15m":["30m","60m"], "30m":["15m","60m"], "60m":["30m","15m"]
-}
+FALLBACKS = {"1m":["2m","5m"], "2m":["5m","15m"], "5m":["15m","30m"], "15m":["30m","60m"], "30m":["15m","60m"], "60m":["30m","15m"]}
 
 def cap_days(interval: str, days: int) -> int:
     return min(int(days), MAX_DAYS.get(interval, 60))
 
-# -----------------------------------
-# Parameters
-# -----------------------------------
+def _try(callable_fn, retries=2, delay=0.6):
+    for i in range(retries+1):
+        try:
+            return callable_fn()
+        except Exception as e:
+            if i == retries: raise
+            time.sleep(delay)
+
+# -------------------------------
+# Params
+# -------------------------------
 @dataclass
 class SignalParams:
     ema_fast: int = 20
@@ -46,15 +57,15 @@ class StrictParams:
     rsi_short_high: float = 45.0
     vol_mult: float = 1.2
     rr_min: float = 1.8
-    vwap_tolerance: float = 0.0003    # 3 bps
-    require_trend_stack: bool = True  # Close>EMA20>EMA50 (or reverse)
+    vwap_tolerance: float = 0.0003
+    require_trend_stack: bool = True
     require_macd_zero_side: bool = True
     require_macd_rising: bool = False
-    session_guard: bool = True        # if RTH: skip first/last 30m
+    session_guard: bool = True
 
-# -----------------------------------
+# -------------------------------
 # Indicators
-# -----------------------------------
+# -------------------------------
 def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
@@ -82,18 +93,16 @@ def vwap(df: pd.DataFrame) -> pd.Series:
     vv = df["Volume"].cumsum().replace(0, np.nan)
     return pv / vv
 
-# -----------------------------------
-# Cleaner & fetchers (cached)
-# -----------------------------------
+# -------------------------------
+# Cleaner
+# -------------------------------
 def _clean_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
+    if df is None or df.empty: return pd.DataFrame()
     if isinstance(df.columns, pd.MultiIndex):
         wanted = {"Open","High","Low","Close","Adj Close","Volume"}
         target_level = None
         for lvl in range(df.columns.nlevels):
-            vals = set(map(str, df.columns.get_level_values(lvl)))
-            if vals & wanted:
+            if set(map(str, df.columns.get_level_values(lvl))) & wanted:
                 target_level = lvl; break
         if target_level is not None:
             df.columns = df.columns.get_level_values(target_level)
@@ -102,75 +111,90 @@ def _clean_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     if "Adj Close" in df.columns and "Close" not in df.columns:
         df = df.rename(columns={"Adj Close":"Close"})
     keep = [c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]
-    if not keep:
-        return pd.DataFrame()
+    if not keep: return pd.DataFrame()
     df = df[keep].copy()
-    for c in df.columns:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+    for c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
     try:
         if getattr(df.index, "tz", None) is None:
             df.index = df.index.tz_localize("UTC")
         df.index = df.index.tz_convert("America/New_York")
-    except Exception:
-        pass
-    df = df.dropna(subset=[c for c in ["Open","High","Low","Close"] if c in df.columns])
-    return df
+    except Exception: pass
+    return df.dropna(subset=[c for c in ["Open","High","Low","Close"] if c in df.columns])
 
+# -------------------------------
+# Cache-bypass control (must influence cache keys)
+# -------------------------------
+with st.sidebar:
+    st.header("Data")
+    symbols = st.text_input("Symbols (space-separated)", "SPY TSLL AAPL")
+    interval = st.selectbox("Interval", ["1m","2m","5m","15m","30m","60m"], index=2)
+    days = st.number_input("Days", 1, 730, 30)
+    rth_only = st.checkbox("RTH only (09:30–16:00 NY)", True)
+    bypass_cache = st.checkbox("Bypass cache (force fresh data)", False)
+    cache_bust = 0 if not bypass_cache else pd.Timestamp.utcnow().value
+
+# -------------------------------
+# Cached fetchers with retries
+# -------------------------------
 @st.cache_data(show_spinner=False, ttl=300)
-def _fetch_download_cached(ticker: str, interval: str, days: int) -> pd.DataFrame:
+def _fetch_download_cached(ticker: str, interval: str, days: int, cache_bust=None) -> pd.DataFrame:
     days = cap_days(interval, days)
+    def _call():
+        return yf.download(tickers=ticker, period=f"{days}d", interval=interval,
+                           auto_adjust=False, progress=False, threads=False, repair=True)
     try:
-        df = yf.download(tickers=ticker, period=f"{days}d", interval=interval,
-                         auto_adjust=False, progress=False, threads=False, repair=True)
+        df = _try(_call)
     except Exception:
         df = pd.DataFrame()
     return _clean_ohlcv(df)
 
 @st.cache_data(show_spinner=False, ttl=300)
-def _fetch_history_cached(ticker: str, interval: str, days: int, prepost: bool) -> pd.DataFrame:
+def _fetch_history_cached(ticker: str, interval: str, days: int, prepost: bool, cache_bust=None) -> pd.DataFrame:
     days = cap_days(interval, days)
+    def _call():
+        return yf.Ticker(ticker).history(period=f"{days}d", interval=interval,
+                                         prepost=prepost, auto_adjust=False, actions=False, repair=True)
     try:
-        df = yf.Ticker(ticker).history(period=f"{days}d", interval=interval,
-                                       prepost=prepost, auto_adjust=False, actions=False, repair=True)
+        df = _try(_call)
     except Exception:
         df = pd.DataFrame()
     return _clean_ohlcv(df)
 
-def fetch_intraday(ticker: str, interval: str="5m", days: int=10, rth_only: bool=False) -> pd.DataFrame:
+def fetch_intraday(ticker: str, interval: str="5m", days: int=10, rth_only: bool=False, cache_bust=None) -> pd.DataFrame:
     def apply_rth(dfi: pd.DataFrame) -> pd.DataFrame:
         if dfi.empty: return dfi
         try: return dfi.between_time("09:30","16:00")
         except Exception: return dfi
 
-    base = _fetch_download_cached(ticker, interval, days)
+    base = _fetch_download_cached(ticker, interval, days, cache_bust)
     if base.empty:
-        base = _fetch_history_cached(ticker, interval, days, prepost=True)
+        base = _fetch_history_cached(ticker, interval, days, prepost=True, cache_bust=cache_bust)
     if base.empty:
-        base = _fetch_history_cached(ticker, interval, days, prepost=False)
+        base = _fetch_history_cached(ticker, interval, days, prepost=False, cache_bust=cache_bust)
 
     dfr = apply_rth(base) if rth_only else base.copy()
     if not dfr.empty: return dfr
     if rth_only and not base.empty: return base
 
     for d_try in [min(cap_days(interval, days), 30), 14, 7, 5, 3]:
-        tmp = _fetch_download_cached(ticker, interval, d_try)
-        if tmp.empty: tmp = _fetch_history_cached(ticker, interval, d_try, prepost=True)
-        if tmp.empty: tmp = _fetch_history_cached(ticker, interval, d_try, prepost=False)
+        tmp = _fetch_download_cached(ticker, interval, d_try, cache_bust)
+        if tmp.empty: tmp = _fetch_history_cached(ticker, interval, d_try, prepost=True, cache_bust=cache_bust)
+        if tmp.empty: tmp = _fetch_history_cached(ticker, interval, d_try, prepost=False, cache_bust=cache_bust)
         tmp = apply_rth(tmp) if rth_only else tmp
         if not tmp.empty: return tmp
 
     for iv in FALLBACKS.get(interval, []):
-        tmp = _fetch_download_cached(ticker, iv, days)
-        if tmp.empty: tmp = _fetch_history_cached(ticker, iv, days, prepost=True)
-        if tmp.empty: tmp = _fetch_history_cached(ticker, iv, days, prepost=False)
+        tmp = _fetch_download_cached(ticker, iv, days, cache_bust)
+        if tmp.empty: tmp = _fetch_history_cached(ticker, iv, days, prepost=True, cache_bust=cache_bust)
+        if tmp.empty: tmp = _fetch_history_cached(ticker, iv, days, prepost=False, cache_bust=cache_bust)
         tmp = apply_rth(tmp) if rth_only else tmp
         if not tmp.empty: return tmp
 
     return pd.DataFrame()
 
-# -----------------------------------
+# -------------------------------
 # Indicators table
-# -----------------------------------
+# -------------------------------
 def compute_indicators(df: pd.DataFrame, p: SignalParams) -> pd.DataFrame:
     out = df.copy()
     out["EMA_fast"] = ema(out["Close"], p.ema_fast)
@@ -183,9 +207,9 @@ def compute_indicators(df: pd.DataFrame, p: SignalParams) -> pd.DataFrame:
     out["VolSMA20"] = out["Volume"].rolling(20).mean()
     return out
 
-# -----------------------------------
+# -------------------------------
 # Signal engine
-# -----------------------------------
+# -------------------------------
 def _pos_size_long(entry: float, stop: float, equity: float, risk_pct: float) -> int:
     risk_amt = equity * (risk_pct/100.0)
     per_share = max(entry - stop, 1e-9)
@@ -209,6 +233,7 @@ def generate_latest_signal(df: pd.DataFrame, p: SignalParams, strict: bool=False
     vol = float(row["Volume"]); vol_sma = float(row.get("VolSMA20", np.nan))
 
     if strict:
+        # RTH 1st/last 30m guard
         if sp.session_guard and getattr(df.index, "tz", None) is not None:
             t = df.index[-2].tz_convert("America/New_York").time()
             if not (t >= pd.Timestamp("10:00").time() and t <= pd.Timestamp("15:30").time()):
@@ -249,21 +274,14 @@ def generate_latest_signal(df: pd.DataFrame, p: SignalParams, strict: bool=False
             rr = (entry - target) / (stop - entry + 1e-9)
             size = _pos_size_short(entry, stop, p.equity, p.risk_pct)
 
-        if rr < sp.rr_min:
-            return None
+        if rr < sp.rr_min: return None
 
         return {
-            "timestamp": df.index[-2],
-            "side": side,
-            "entry": round(entry, 4),
-            "stop": round(stop, 4),
-            "target": round(target, 4),
-            "atr": round(atr_v, 4),
-            "rsi": round(rsi_v, 2),
-            "macd_hist": round(macd_h, 4),
-            "vwap": round(vwap_v, 4),
-            "rr_ratio": round(float(rr), 2),
-            "position_size": int(size),
+            "timestamp": df.index[-2], "side": side,
+            "entry": round(entry, 4), "stop": round(stop, 4), "target": round(target, 4),
+            "atr": round(atr_v, 4), "rsi": round(rsi_v, 2),
+            "macd_hist": round(macd_h, 4), "vwap": round(vwap_v, 4),
+            "rr_ratio": round(float(rr), 2), "position_size": int(size),
         }
 
     # non-strict confluence
@@ -287,29 +305,22 @@ def generate_latest_signal(df: pd.DataFrame, p: SignalParams, strict: bool=False
         rr = (entry - target) / (stop - entry + 1e-9)
 
     return {
-        "timestamp": df.index[-2],
-        "side": side,
-        "entry": round(entry,4),
-        "stop": round(stop,4),
-        "target": round(target,4),
-        "atr": round(float(atr_v),4),
-        "rsi": round(float(rsi_v),2),
-        "macd_hist": round(float(macd_h),4),
-        "vwap": round(float(vwap_v),4),
-        "rr_ratio": round(float(rr),2),
-        "position_size": int(size),
+        "timestamp": df.index[-2], "side": side,
+        "entry": round(entry,4), "stop": round(stop,4), "target": round(target,4),
+        "atr": round(float(atr_v),4), "rsi": round(float(rsi_v),2),
+        "macd_hist": round(float(macd_h),4), "vwap": round(float(vwap_v),4),
+        "rr_ratio": round(float(rr),2), "position_size": int(size),
     }
 
-# -----------------------------------
-# S&P 500 loader (auto, cached) + universe parser
-# -----------------------------------
+# -------------------------------
+# S&P 500 (auto) + cache
+# -------------------------------
 @st.cache_data(show_spinner=True, ttl=3600)
 def load_sp500() -> List[str]:
     try:
         tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
         df_sp = tables[0]
-        syms = df_sp["Symbol"].astype(str).tolist()
-        syms = [s.replace(".", "-").strip().upper() for s in syms if s.strip()]
+        syms = [s.replace(".", "-").strip().upper() for s in df_sp["Symbol"].astype(str).tolist() if s.strip()]
         # de-dup keep order
         seen = set(); out = []
         for s in syms:
@@ -320,78 +331,44 @@ def load_sp500() -> List[str]:
         fallback = "AAPL MSFT NVDA AMZN GOOGL META BRK-B JPM JNJ UNH XOM AVGO PEP LLY V MA PG COST HD MRK ABBV KO PFE BAC NFLX CRM ORCL INTC TMO MCD CSCO VZ ADP WMT"
         return [s.strip().upper() for s in fallback.split()]
 
-def parse_universe(choice: str, custom: str) -> List[str]:
-    if choice == "S&P 500 (auto)":
-        syms = load_sp500()
-    else:
-        mapping = {
-            "Top Tech (AAPL MSFT NVDA AMZN GOOGL META AMD TSLA)":
-                "AAPL MSFT NVDA AMZN GOOGL META AMD TSLA",
-            "Index ETFs (SPY QQQ IWM DIA TLT HYG XLF XLK XLE XLY)":
-                "SPY QQQ IWM DIA TLT HYG XLF XLK XLE XLY",
-            "Mega Liquids (SPY AAPL MSFT NVDA TSLA AMD AMZN META GOOGL QQQ)":
-                "SPY AAPL MSFT NVDA TSLA AMD AMZN META GOOGL QQQ",
-            "Levered ETFs (TSLL TQQQ SOXL LABU SQQQ SOXS UVXY SVXY)":
-                "TSLL TQQQ SOXL LABU SQQQ SOXS UVXY SVXY",
-            "Custom (type below)":
-                custom
-        }
-        syms = [s.strip().upper() for s in mapping.get(choice, custom).split() if s.strip()]
-    # de-dup keep order
-    seen = set(); out = []
-    for s in syms:
-        if s not in seen:
-            out.append(s); seen.add(s)
-    return out
+# -------------------------------
+# Sidebar (filters, presets, risk)
+# -------------------------------
+st.sidebar.divider()
+st.sidebar.header("Presets")
+preset = st.sidebar.selectbox("🎚️ Preset Strategy", ["Custom","Conservative","Balanced","Aggressive"])
+presets = {
+    "Conservative": dict(strict=True,  volume_mult=1.2,  rr_min=1.8,  vwap_tol=0.0002, rsi_long=(55,65), rsi_short=(35,45), macd_slope=True),
+    "Balanced":     dict(strict=True,  volume_mult=1.1,  rr_min=1.6,  vwap_tol=0.0003, rsi_long=(53,67), rsi_short=(33,47), macd_slope=False),
+    "Aggressive":   dict(strict=True,  volume_mult=1.05, rr_min=1.5,  vwap_tol=0.0005, rsi_long=(50,70), rsi_short=(30,50), macd_slope=False),
+}
+cfg = presets.get(preset, {})
 
-# -----------------------------------
-# UI: Controls
-# -----------------------------------
-st.title("📊 Intraday Recommender (Presets + Signals + Backtest + Scanner)")
+st.sidebar.divider()
+st.sidebar.header("Filters")
+strict_mode = st.sidebar.checkbox("Strict mode", value=cfg.get("strict", False))
+vol_mult = st.sidebar.slider("Volume × SMA20 ≥", 1.0, 2.0, cfg.get("volume_mult", 1.1), 0.05)
+rr_min = st.sidebar.slider("Min RR", 1.2, 3.0, cfg.get("rr_min", 1.6), 0.1)
+vwap_tol_bps = st.sidebar.slider("VWAP tolerance (bps)", 0, 20, int(cfg.get("vwap_tol", 0.0003)*10000))
+vwap_tol = vwap_tol_bps / 10000.0
+macd_slope = st.sidebar.checkbox("Require MACD hist rising/falling", value=cfg.get("macd_slope", False))
+require_stack = st.sidebar.checkbox("Require Close>EMA20>EMA50", True)
+session_guard = st.sidebar.checkbox("Skip 1st/last 30m if RTH", True)
 
-with st.sidebar:
-    st.header("Data")
-    symbols = st.text_input("Symbols (space-separated)", "SPY TSLL AAPL")
-    interval = st.selectbox("Interval", ["1m","2m","5m","15m","30m","60m"], index=2)
-    days = st.number_input("Days", 1, 730, 30)
-    rth_only = st.checkbox("RTH only (09:30–16:00 NY)", True)
+rsi_long_min, rsi_long_max = st.sidebar.slider("RSI Long band", 40, 80, cfg.get("rsi_long", (53,67)))
+rsi_short_min, rsi_short_max = st.sidebar.slider("RSI Short band", 20, 60, cfg.get("rsi_short", (33,47)))
 
-    st.divider()
-    st.header("Presets")
-    preset = st.selectbox("🎚️ Preset Strategy", ["Custom","Conservative","Balanced","Aggressive"])
+st.sidebar.divider()
+st.sidebar.header("Risk")
+equity = st.sidebar.number_input("Account equity", 1000, 5_000_000, 25_000, 500)
+risk_pct = st.sidebar.slider("Risk % per trade", 0.1, 5.0, 1.0, 0.1)
+min_conf = st.sidebar.slider("Non-strict: min agreeing checks", 2, 5, 3)
 
-    presets = {
-        "Conservative": dict(strict=True,  volume_mult=1.2,  rr_min=1.8,  vwap_tol=0.0002, rsi_long=(55,65), rsi_short=(35,45), macd_slope=True),
-        "Balanced":     dict(strict=True,  volume_mult=1.1,  rr_min=1.6,  vwap_tol=0.0003, rsi_long=(53,67), rsi_short=(33,47), macd_slope=False),
-        "Aggressive":   dict(strict=True,  volume_mult=1.05, rr_min=1.5,  vwap_tol=0.0005, rsi_long=(50,70), rsi_short=(30,50), macd_slope=False),
-    }
-    cfg = presets.get(preset, {})
+st.sidebar.divider()
+show_debug = st.sidebar.checkbox("🔧 Show raw data debug", False)
+run_btn = st.sidebar.button("Run now")
 
-    st.divider()
-    st.header("Filters")
-    strict_mode = st.checkbox("Strict mode", value=cfg.get("strict", False))
-    vol_mult = st.slider("Volume × SMA20 ≥", 1.0, 2.0, cfg.get("volume_mult", 1.1), 0.05)
-    rr_min = st.slider("Min RR", 1.2, 3.0, cfg.get("rr_min", 1.6), 0.1)
-    vwap_tol_bps = st.slider("VWAP tolerance (bps)", 0, 20, int(cfg.get("vwap_tol", 0.0003)*10000))
-    vwap_tol = vwap_tol_bps / 10000.0
-    macd_slope = st.checkbox("Require MACD hist rising/falling", value=cfg.get("macd_slope", False))
-    require_stack = st.checkbox("Require Close>EMA20>EMA50", True)
-    session_guard = st.checkbox("Skip 1st/last 30m if RTH", True)
-
-    rsi_long_min, rsi_long_max = st.slider("RSI Long band", 40, 80, cfg.get("rsi_long", (53,67)))
-    rsi_short_min, rsi_short_max = st.slider("RSI Short band", 20, 60, cfg.get("rsi_short", (33,47)))
-
-    st.divider()
-    st.header("Risk")
-    equity = st.number_input("Account equity", 1000, 5_000_000, 25_000, 500)
-    risk_pct = st.slider("Risk % per trade", 0.1, 5.0, 1.0, 0.1)
-    min_conf = st.slider("Non-strict: min agreeing checks", 2, 5, 3)
-
-    st.divider()
-    show_debug = st.checkbox("🔧 Show raw data debug", False)
-    run_btn = st.button("Run now")
-
-# bundle current params
+# Bundle params
 symbols_list = [s.strip().upper() for s in symbols.split() if s.strip()]
 days_capped = cap_days(interval, days)
 P = SignalParams(equity=float(equity), risk_pct=float(risk_pct), min_confluence=int(min_conf))
@@ -403,22 +380,41 @@ SP = StrictParams(
     require_macd_rising=bool(macd_slope), session_guard=bool(session_guard)
 )
 
-# debug panel
+# -------------------------------
+# Environment debug (to match cloud vs local)
+# -------------------------------
+with st.expander("Environment (debug)", expanded=False):
+    st.write({
+        "Python": tuple(__import__("sys").version.split()[0:1])[0],
+        "streamlit": __import__("streamlit").__version__,
+        "yfinance": __import__("yfinance").__version__,
+        "pandas": __import__("pandas").__version__,
+        "numpy": __import__("numpy").__version__,
+        "scipy": __import__("scipy").__version__,
+        "Server UTC now": pd.Timestamp.utcnow(),
+        "NY time now": pd.Timestamp.utcnow().tz_localize("UTC").tz_convert("America/New_York"),
+        "Interval": interval, "Days requested": int(days), "Days capped": days_capped,
+        "RTH only": rth_only, "Strict": strict_mode, "Bypass cache": bypass_cache
+    })
+
+# -------------------------------
+# Debug fetch preview
+# -------------------------------
 if show_debug and symbols_list:
     sym0 = symbols_list[0]
     st.info(f"Debug fetch for {sym0} ({interval}, {days_capped}d, RTH={'ON' if rth_only else 'OFF'})")
-    dbg = fetch_intraday(sym0, interval=interval, days=days_capped, rth_only=bool(rth_only))
+    dbg = fetch_intraday(sym0, interval=interval, days=days_capped, rth_only=bool(rth_only), cache_bust=cache_bust)
     st.write("Shape:", dbg.shape)
     st.write("Columns:", list(dbg.columns))
     st.dataframe(dbg.tail(12), width='stretch')
 
-# -----------------------------------
-# Recommendations for current list
-# -----------------------------------
+# -------------------------------
+# Recommendations (current symbols)
+# -------------------------------
 if run_btn:
     rec_rows = []
     for sym in symbols_list:
-        raw = fetch_intraday(sym, interval=interval, days=days_capped, rth_only=bool(rth_only))
+        raw = fetch_intraday(sym, interval=interval, days=days_capped, rth_only=bool(rth_only), cache_bust=cache_bust)
         if raw.empty:
             rec_rows.append(dict(Ticker=sym, **{k:np.nan for k in ["Time(NY)","Side","Entry","Stop","Target","ATR","RSI","MACD_hist","VWAP","RR","PositionSize"]}))
             continue
@@ -454,7 +450,7 @@ if run_btn:
     st.subheader("Details per symbol")
     for sym in symbols_list:
         st.markdown(f"**{sym}**")
-        raw = fetch_intraday(sym, interval=interval, days=days_capped, rth_only=bool(rth_only))
+        raw = fetch_intraday(sym, interval=interval, days=days_capped, rth_only=bool(rth_only), cache_bust=cache_bust)
         if raw.empty:
             st.warning(f"No data for {sym}")
             continue
@@ -462,9 +458,9 @@ if run_btn:
         st.dataframe(dfi.tail(12), width='stretch')
         st.line_chart(dfi["Close"])
 
-# -----------------------------------
-# 🔎 Scanner (same criteria across a universe, includes S&P 500 auto)
-# -----------------------------------
+# -------------------------------
+# Scanner (S&P500 auto + custom)
+# -------------------------------
 st.divider()
 st.header("🔎 Scan for Opportunities")
 
@@ -486,9 +482,32 @@ with scan_col2:
     show_only_actionable = st.checkbox("Only actionable (Side ≠ NONE)", True)
 
 custom_universe = st.text_input("Custom symbols (space-separated)", "SPY TSLL AAPL")
-scan_syms = parse_universe(universe_choice, custom_universe)
 
-# Cap & status for large universes
+def parse_universe(choice: str, custom: str) -> List[str]:
+    if choice == "S&P 500 (auto)":
+        syms = load_sp500()
+    else:
+        mapping = {
+            "Top Tech (AAPL MSFT NVDA AMZN GOOGL META AMD TSLA)":
+                "AAPL MSFT NVDA AMZN GOOGL META AMD TSLA",
+            "Index ETFs (SPY QQQ IWM DIA TLT HYG XLF XLK XLE XLY)":
+                "SPY QQQ IWM DIA TLT HYG XLF XLK XLE XLY",
+            "Mega Liquids (SPY AAPL MSFT NVDA TSLA AMD AMZN META GOOGL QQQ)":
+                "SPY AAPL MSFT NVDA TSLA AMD AMZN META GOOGL QQQ",
+            "Levered ETFs (TSLL TQQQ SOXL LABU SQQQ SOXS UVXY SVXY)":
+                "TSLL TQQQ SOXL LABU SQQQ SOXS UVXY SVXY",
+            "Custom (type below)":
+                custom
+        }
+        syms = [s.strip().upper() for s in mapping.get(choice, custom).split() if s.strip()]
+    # de-dup keep order
+    seen = set(); out = []
+    for s in syms:
+        if s not in seen:
+            out.append(s); seen.add(s)
+    return out
+
+scan_syms = parse_universe(universe_choice, custom_universe)
 max_scan = st.slider("Max tickers to scan", 50, 500, 150, 25)
 scan_syms = scan_syms[:max_scan]
 st.caption(f"Scanning {len(scan_syms)} tickers… Adjust with the slider above.")
@@ -497,13 +516,13 @@ scan_save_csv = st.text_input("Save scan results CSV (optional path)", "")
 scan_btn = st.button("Run Scan")
 
 def scan_universe(symbols: List[str], interval: str, days: int, rth_only: bool,
-                  P: SignalParams, strict_mode: bool, SP: StrictParams) -> pd.DataFrame:
+                  P: SignalParams, strict_mode: bool, SP: StrictParams, cache_bust=None) -> pd.DataFrame:
     rows = []
     n = len(symbols)
     prog = st.progress(0.0, text=f"Scanning {n} symbols…")
     for i, sym in enumerate(symbols, 1):
         try:
-            raw = fetch_intraday(sym, interval=interval, days=days, rth_only=rth_only)
+            raw = fetch_intraday(sym, interval=interval, days=days, rth_only=rth_only, cache_bust=cache_bust)
             if raw.empty:
                 rows.append({"Ticker": sym, "Side": "NONE", "Reason": "No data"})
             else:
@@ -535,7 +554,7 @@ def scan_universe(symbols: List[str], interval: str, days: int, rth_only: bool,
 if scan_btn:
     with st.spinner("Sweeping universe…"):
         scan_df = scan_universe(scan_syms, interval=interval, days=days_capped, rth_only=bool(rth_only),
-                                P=P, strict_mode=bool(strict_mode), SP=SP)
+                                P=P, strict_mode=bool(strict_mode), SP=SP, cache_bust=cache_bust)
 
     st.subheader("Scan Results")
     if show_only_actionable and not scan_df.empty:
