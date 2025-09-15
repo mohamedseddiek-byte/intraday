@@ -1,5 +1,6 @@
-# app.py — One-file, cloud-stable Intraday Recommender + Scanner
-# Fixes: pinned behavior, cache-bypass, retries, explicit TZ, S&P500 auto, presets, strict/non-strict
+# app.py — Cloud-stable Intraday Recommender & Scanner
+# Safe debug (no hard imports), cache-bypass, retries, explicit NY TZ, S&P 500 auto, presets, strict/non-strict
+
 import time
 import streamlit as st
 import pandas as pd
@@ -18,21 +19,25 @@ st.title("📈 Intraday Recommender & Scanner")
 # Constants & helpers
 # -------------------------------
 MAX_DAYS = {"1m":7, "2m":60, "5m":60, "15m":60, "30m":60, "60m":730}
-FALLBACKS = {"1m":["2m","5m"], "2m":["5m","15m"], "5m":["15m","30m"], "15m":["30m","60m"], "30m":["15m","60m"], "60m":["30m","15m"]}
+FALLBACKS = {
+    "1m":["2m","5m"], "2m":["5m","15m"], "5m":["15m","30m"],
+    "15m":["30m","60m"], "30m":["15m","60m"], "60m":["30m","15m"]
+}
 
 def cap_days(interval: str, days: int) -> int:
     return min(int(days), MAX_DAYS.get(interval, 60))
 
 def _try(callable_fn, retries=2, delay=0.6):
-    for i in range(retries+1):
+    for i in range(retries + 1):
         try:
             return callable_fn()
-        except Exception as e:
-            if i == retries: raise
+        except Exception:
+            if i == retries:
+                raise
             time.sleep(delay)
 
 # -------------------------------
-# Params
+# Parameters
 # -------------------------------
 @dataclass
 class SignalParams:
@@ -57,7 +62,7 @@ class StrictParams:
     rsi_short_high: float = 45.0
     vol_mult: float = 1.2
     rr_min: float = 1.8
-    vwap_tolerance: float = 0.0003
+    vwap_tolerance: float = 0.0003  # 3 bps
     require_trend_stack: bool = True
     require_macd_zero_side: bool = True
     require_macd_rising: bool = False
@@ -76,7 +81,7 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     rs = ru / (rd + 1e-12)
     return 100.0 - (100.0 / (1.0 + rs))
 
-def macd(series: pd.Series, fast=12, slow=26, signal=9) -> Tuple[pd.Series,pd.Series,pd.Series]:
+def macd(series: pd.Series, fast=12, slow=26, signal=9) -> Tuple[pd.Series, pd.Series, pd.Series]:
     f = ema(series, fast); s = ema(series, slow)
     line = f - s; sig = ema(line, signal); hist = line - sig
     return line, sig, hist
@@ -97,9 +102,10 @@ def vwap(df: pd.DataFrame) -> pd.Series:
 # Cleaner
 # -------------------------------
 def _clean_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty: return pd.DataFrame()
+    if df is None or df.empty:
+        return pd.DataFrame()
     if isinstance(df.columns, pd.MultiIndex):
-        wanted = {"Open","High","Low","Close","Adj Close","Volume"}
+        wanted = {"Open", "High", "Low", "Close", "Adj Close", "Volume"}
         target_level = None
         for lvl in range(df.columns.nlevels):
             if set(map(str, df.columns.get_level_values(lvl))) & wanted:
@@ -109,25 +115,28 @@ def _clean_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
         else:
             df.columns = ["_".join([str(x) for x in tup if x is not None]) for tup in df.columns]
     if "Adj Close" in df.columns and "Close" not in df.columns:
-        df = df.rename(columns={"Adj Close":"Close"})
-    keep = [c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]
-    if not keep: return pd.DataFrame()
+        df = df.rename(columns={"Adj Close": "Close"})
+    keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+    if not keep:
+        return pd.DataFrame()
     df = df[keep].copy()
-    for c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
+    for c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
     try:
         if getattr(df.index, "tz", None) is None:
             df.index = df.index.tz_localize("UTC")
         df.index = df.index.tz_convert("America/New_York")
-    except Exception: pass
-    return df.dropna(subset=[c for c in ["Open","High","Low","Close"] if c in df.columns])
+    except Exception:
+        pass
+    return df.dropna(subset=[c for c in ["Open", "High", "Low", "Close"] if c in df.columns])
 
 # -------------------------------
-# Cache-bypass control (must influence cache keys)
+# Sidebar: data & cache-bypass
 # -------------------------------
 with st.sidebar:
     st.header("Data")
     symbols = st.text_input("Symbols (space-separated)", "SPY TSLL AAPL")
-    interval = st.selectbox("Interval", ["1m","2m","5m","15m","30m","60m"], index=2)
+    interval = st.selectbox("Interval", ["1m", "2m", "5m", "15m", "30m", "60m"], index=2)
     days = st.number_input("Days", 1, 730, 30)
     rth_only = st.checkbox("RTH only (09:30–16:00 NY)", True)
     bypass_cache = st.checkbox("Bypass cache (force fresh data)", False)
@@ -140,8 +149,10 @@ with st.sidebar:
 def _fetch_download_cached(ticker: str, interval: str, days: int, cache_bust=None) -> pd.DataFrame:
     days = cap_days(interval, days)
     def _call():
-        return yf.download(tickers=ticker, period=f"{days}d", interval=interval,
-                           auto_adjust=False, progress=False, threads=False, repair=True)
+        return yf.download(
+            tickers=ticker, period=f"{days}d", interval=interval,
+            auto_adjust=False, progress=False, threads=False, repair=True
+        )
     try:
         df = _try(_call)
     except Exception:
@@ -152,8 +163,10 @@ def _fetch_download_cached(ticker: str, interval: str, days: int, cache_bust=Non
 def _fetch_history_cached(ticker: str, interval: str, days: int, prepost: bool, cache_bust=None) -> pd.DataFrame:
     days = cap_days(interval, days)
     def _call():
-        return yf.Ticker(ticker).history(period=f"{days}d", interval=interval,
-                                         prepost=prepost, auto_adjust=False, actions=False, repair=True)
+        return yf.Ticker(ticker).history(
+            period=f"{days}d", interval=interval, prepost=prepost,
+            auto_adjust=False, actions=False, repair=True
+        )
     try:
         df = _try(_call)
     except Exception:
@@ -163,7 +176,7 @@ def _fetch_history_cached(ticker: str, interval: str, days: int, prepost: bool, 
 def fetch_intraday(ticker: str, interval: str="5m", days: int=10, rth_only: bool=False, cache_bust=None) -> pd.DataFrame:
     def apply_rth(dfi: pd.DataFrame) -> pd.DataFrame:
         if dfi.empty: return dfi
-        try: return dfi.between_time("09:30","16:00")
+        try: return dfi.between_time("09:30", "16:00")
         except Exception: return dfi
 
     base = _fetch_download_cached(ticker, interval, days, cache_bust)
@@ -256,7 +269,7 @@ def generate_latest_signal(df: pd.DataFrame, p: SignalParams, strict: bool=False
 
         vol_ok = (not np.isnan(vol_sma)) and (vol >= sp.vol_mult * vol_sma)
 
-        long_ok  = trend_long  and rsi_long_ok  and macd_side_long  and macd_slope_long  and vwap_long  and vol_ok and (atr_v > 0)
+        long_ok  = trend_long and rsi_long_ok and macd_side_long and macd_slope_long and vwap_long and vol_ok and (atr_v > 0)
         short_ok = trend_short and rsi_short_ok and macd_side_short and macd_slope_short and vwap_short and vol_ok and (atr_v > 0)
 
         side = "LONG" if long_ok else ("SHORT" if short_ok else None)
@@ -274,7 +287,8 @@ def generate_latest_signal(df: pd.DataFrame, p: SignalParams, strict: bool=False
             rr = (entry - target) / (stop - entry + 1e-9)
             size = _pos_size_short(entry, stop, p.equity, p.risk_pct)
 
-        if rr < sp.rr_min: return None
+        if rr < sp.rr_min:
+            return None
 
         return {
             "timestamp": df.index[-2], "side": side,
@@ -306,10 +320,10 @@ def generate_latest_signal(df: pd.DataFrame, p: SignalParams, strict: bool=False
 
     return {
         "timestamp": df.index[-2], "side": side,
-        "entry": round(entry,4), "stop": round(stop,4), "target": round(target,4),
-        "atr": round(float(atr_v),4), "rsi": round(float(rsi_v),2),
-        "macd_hist": round(float(macd_h),4), "vwap": round(float(vwap_v),4),
-        "rr_ratio": round(float(rr),2), "position_size": int(size),
+        "entry": round(entry, 4), "stop": round(stop, 4), "target": round(target, 4),
+        "atr": round(float(atr_v), 4), "rsi": round(float(rsi_v), 2),
+        "macd_hist": round(float(macd_h), 4), "vwap": round(float(vwap_v), 4),
+        "rr_ratio": round(float(rr), 2), "position_size": int(size),
     }
 
 # -------------------------------
@@ -332,11 +346,11 @@ def load_sp500() -> List[str]:
         return [s.strip().upper() for s in fallback.split()]
 
 # -------------------------------
-# Sidebar (filters, presets, risk)
+# Sidebar: presets, filters, risk
 # -------------------------------
 st.sidebar.divider()
 st.sidebar.header("Presets")
-preset = st.sidebar.selectbox("🎚️ Preset Strategy", ["Custom","Conservative","Balanced","Aggressive"])
+preset = st.sidebar.selectbox("🎚️ Preset Strategy", ["Custom", "Conservative", "Balanced", "Aggressive"])
 presets = {
     "Conservative": dict(strict=True,  volume_mult=1.2,  rr_min=1.8,  vwap_tol=0.0002, rsi_long=(55,65), rsi_short=(35,45), macd_slope=True),
     "Balanced":     dict(strict=True,  volume_mult=1.1,  rr_min=1.6,  vwap_tol=0.0003, rsi_long=(53,67), rsi_short=(33,47), macd_slope=False),
@@ -349,14 +363,14 @@ st.sidebar.header("Filters")
 strict_mode = st.sidebar.checkbox("Strict mode", value=cfg.get("strict", False))
 vol_mult = st.sidebar.slider("Volume × SMA20 ≥", 1.0, 2.0, cfg.get("volume_mult", 1.1), 0.05)
 rr_min = st.sidebar.slider("Min RR", 1.2, 3.0, cfg.get("rr_min", 1.6), 0.1)
-vwap_tol_bps = st.sidebar.slider("VWAP tolerance (bps)", 0, 20, int(cfg.get("vwap_tol", 0.0003)*10000))
+vwap_tol_bps = st.sidebar.slider("VWAP tolerance (bps)", 0, 20, int(cfg.get("vwap_tol", 0.0003) * 10000))
 vwap_tol = vwap_tol_bps / 10000.0
 macd_slope = st.sidebar.checkbox("Require MACD hist rising/falling", value=cfg.get("macd_slope", False))
 require_stack = st.sidebar.checkbox("Require Close>EMA20>EMA50", True)
 session_guard = st.sidebar.checkbox("Skip 1st/last 30m if RTH", True)
 
-rsi_long_min, rsi_long_max = st.sidebar.slider("RSI Long band", 40, 80, cfg.get("rsi_long", (53,67)))
-rsi_short_min, rsi_short_max = st.sidebar.slider("RSI Short band", 20, 60, cfg.get("rsi_short", (33,47)))
+rsi_long_min, rsi_long_max = st.sidebar.slider("RSI Long band", 40, 80, cfg.get("rsi_long", (53, 67)))
+rsi_short_min, rsi_short_max = st.sidebar.slider("RSI Short band", 20, 60, cfg.get("rsi_short", (33, 47)))
 
 st.sidebar.divider()
 st.sidebar.header("Risk")
@@ -381,16 +395,26 @@ SP = StrictParams(
 )
 
 # -------------------------------
-# Environment debug (to match cloud vs local)
+# Environment debug (SAFE imports)
 # -------------------------------
+def _pkg_ver(name: str) -> str:
+    try:
+        return __import__(name).__version__
+    except Exception:
+        return "not-installed"
+
 with st.expander("Environment (debug)", expanded=False):
     st.write({
         "Python": tuple(__import__("sys").version.split()[0:1])[0],
-        "streamlit": __import__("streamlit").__version__,
-        "yfinance": __import__("yfinance").__version__,
-        "pandas": __import__("pandas").__version__,
-        "numpy": __import__("numpy").__version__,
-        "scipy": __import__("scipy").__version__,
+        "streamlit": _pkg_ver("streamlit"),
+        "yfinance": _pkg_ver("yfinance"),
+        "pandas": _pkg_ver("pandas"),
+        "numpy": _pkg_ver("numpy"),
+        "scipy": _pkg_ver("scipy"),
+        "beautifulsoup4": _pkg_ver("bs4"),
+        "lxml": _pkg_ver("lxml"),
+        "html5lib": _pkg_ver("html5lib"),
+        "requests": _pkg_ver("requests"),
         "Server UTC now": pd.Timestamp.utcnow(),
         "NY time now": pd.Timestamp.utcnow().tz_localize("UTC").tz_convert("America/New_York"),
         "Interval": interval, "Days requested": int(days), "Days capped": days_capped,
@@ -416,16 +440,21 @@ if run_btn:
     for sym in symbols_list:
         raw = fetch_intraday(sym, interval=interval, days=days_capped, rth_only=bool(rth_only), cache_bust=cache_bust)
         if raw.empty:
-            rec_rows.append(dict(Ticker=sym, **{k:np.nan for k in ["Time(NY)","Side","Entry","Stop","Target","ATR","RSI","MACD_hist","VWAP","RR","PositionSize"]}))
+            rec_rows.append(dict(Ticker=sym, **{k: np.nan for k in [
+                "Time(NY)", "Side", "Entry", "Stop", "Target", "ATR", "RSI", "MACD_hist", "VWAP", "RR", "PositionSize"
+            ]}))
             continue
         dfi = compute_indicators(raw, P).dropna().copy()
         sig = generate_latest_signal(dfi, P, strict=bool(strict_mode), sp=SP if strict_mode else None)
         if sig is None:
-            rec_rows.append(dict(Ticker=sym, Time_NY=dfi.index[-2], Side="NONE",
-                                 Entry=np.nan, Stop=np.nan, Target=np.nan,
-                                 ATR=dfi["ATR"].iloc[-2], RSI=dfi["RSI"].iloc[-2],
-                                 MACD_hist=dfi["MACD_hist"].iloc[-2], VWAP=dfi["VWAP"].iloc[-2],
-                                 RR=np.nan, PositionSize=0))
+            rec_rows.append(dict(
+                Ticker=sym,
+                Time_NY=dfi.index[-2], Side="NONE",
+                Entry=np.nan, Stop=np.nan, Target=np.nan,
+                ATR=dfi["ATR"].iloc[-2], RSI=dfi["RSI"].iloc[-2],
+                MACD_hist=dfi["MACD_hist"].iloc[-2], VWAP=dfi["VWAP"].iloc[-2],
+                RR=np.nan, PositionSize=0
+            ))
         else:
             ts = sig["timestamp"]
             try: ts = ts.tz_convert("America/New_York")
@@ -440,7 +469,7 @@ if run_btn:
     st.subheader("Recommendations (latest completed bar)")
     rec_df = pd.DataFrame(rec_rows)
     if not rec_df.empty:
-        cols = ["Ticker","Time(NY)","Side","Entry","Stop","Target","RR","PositionSize","ATR","RSI","MACD_hist","VWAP"]
+        cols = ["Ticker", "Time(NY)", "Side", "Entry", "Stop", "Target", "RR", "PositionSize", "ATR", "RSI", "MACD_hist", "VWAP"]
         rec_df = rec_df[[c for c in cols if c in rec_df.columns]]
         st.dataframe(rec_df, width='stretch')
     else:
@@ -464,7 +493,7 @@ if run_btn:
 st.divider()
 st.header("🔎 Scan for Opportunities")
 
-scan_col1, scan_col2 = st.columns([2,1])
+scan_col1, scan_col2 = st.columns([2, 1])
 with scan_col1:
     universe_choice = st.selectbox(
         "Universe",
@@ -531,10 +560,10 @@ def scan_universe(symbols: List[str], interval: str, days: int, rth_only: bool,
                 if sig is None:
                     rows.append({
                         "Ticker": sym, "Side": "NONE",
-                        "RSI": round(float(dfi["RSI"].iloc[-2]),2),
-                        "MACD_hist": round(float(dfi["MACD_hist"].iloc[-2]),4),
-                        "VWAP": round(float(dfi["VWAP"].iloc[-2]),4),
-                        "ATR": round(float(dfi["ATR"].iloc[-2]),4),
+                        "RSI": round(float(dfi["RSI"].iloc[-2]), 2),
+                        "MACD_hist": round(float(dfi["MACD_hist"].iloc[-2]), 4),
+                        "VWAP": round(float(dfi["VWAP"].iloc[-2]), 4),
+                        "ATR": round(float(dfi["ATR"].iloc[-2]), 4),
                     })
                 else:
                     ts = sig["timestamp"]
@@ -548,22 +577,24 @@ def scan_universe(symbols: List[str], interval: str, days: int, rth_only: bool,
                     })
         except Exception as e:
             rows.append({"Ticker": sym, "Side": "ERROR", "Reason": str(e)})
-        prog.progress(i / max(n,1), text=f"Scanning {n} symbols… ({i}/{n})")
+        prog.progress(i / max(n, 1), text=f"Scanning {n} symbols… ({i}/{n})")
     return pd.DataFrame(rows)
 
 if scan_btn:
     with st.spinner("Sweeping universe…"):
-        scan_df = scan_universe(scan_syms, interval=interval, days=days_capped, rth_only=bool(rth_only),
-                                P=P, strict_mode=bool(strict_mode), SP=SP, cache_bust=cache_bust)
+        scan_df = scan_universe(
+            scan_syms, interval=interval, days=days_capped, rth_only=bool(rth_only),
+            P=P, strict_mode=bool(strict_mode), SP=SP, cache_bust=cache_bust
+        )
 
     st.subheader("Scan Results")
     if show_only_actionable and not scan_df.empty:
-        actionable = scan_df[scan_df["Side"].isin(["LONG","SHORT"])].copy()
+        actionable = scan_df[scan_df["Side"].isin(["LONG", "SHORT"])].copy()
         if actionable.empty:
             st.info("No actionable signals found with current filters.")
         else:
             if "RR" in actionable.columns:
-                actionable = actionable.sort_values(by=["RR","PositionSize"], ascending=[False, False])
+                actionable = actionable.sort_values(by=["RR", "PositionSize"], ascending=[False, False])
             st.dataframe(actionable, width='stretch')
     else:
         st.dataframe(scan_df, width='stretch')
